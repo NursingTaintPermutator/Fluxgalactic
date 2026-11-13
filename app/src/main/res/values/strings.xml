@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Galaxis-Pfeil</string>
+    <string name="wallpaper_description">3D-Pfeil zum galaktischen Zentrum vor Sternenhimmel</string>
+    <string name="setup_info">Der Pfeil zeigt immer zum Zentrum der Milchstraße. Dafür wird dein grober Standort benötigt (sonst wird er aus der Zeitzone geschätzt).</string>
+    <string name="setup_location">Standort erlauben</string>
+    <string name="setup_set_wallpaper">Als Hintergrund einstellen</string>
+</resources>
