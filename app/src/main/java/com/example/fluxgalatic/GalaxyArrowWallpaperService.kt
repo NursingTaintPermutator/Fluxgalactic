@@ -47,6 +47,14 @@ private const val LX = -0.352f
 private const val LY = 0.5535f
 private const val LZ = 0.7547f
 private const val MAX_LOC_AGE_MS = 30 * 60_000L
+private const val ECL_RINGS = 3
+private const val ECL_SEG = 72
+private const val ECL_RAYS = 12
+private const val ECL_RADIUS = 1.1f
+private const val GAL_RADIUS = 1.7f
+private const val R0_KM = 8275.0 * 3.0856775814913673e13
+private const val AU_KM = 149597870.7
+private const val SUN_APPROACH_KMS = 11.1
 class GalaxyArrowWallpaperService : WallpaperService() {
 
     override fun onCreateEngine(): Engine = ArrowEngine()
@@ -107,6 +115,53 @@ class GalaxyArrowWallpaperService : WallpaperService() {
             textAlign = Paint.Align.CENTER
         }
         private val path = Path()
+
+        // ---------- Ekliptik ----------
+        private val gridBack = Path()
+        private val gridFront = Path()
+        private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 1f * density
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val sunPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val eclPole = DoubleArray(3)
+        private val eclEquinox = DoubleArray(3)
+        private val eclN = DoubleArray(3)
+        private val eclX = DoubleArray(3)
+        private val eclY = DoubleArray(3)
+        private var eclInit = false
+        private var sunLonRad = 0.0
+        private val ringCos = FloatArray(ECL_SEG + 1) { cos(2.0 * PI * it / ECL_SEG).toFloat() }
+        private val ringSin = FloatArray(ECL_SEG + 1) { sin(2.0 * PI * it / ECL_SEG).toFloat() }
+        private val ex = FloatArray(ECL_RINGS * (ECL_SEG + 1))
+        private val ey = FloatArray(ECL_RINGS * (ECL_SEG + 1))
+        private val ez = FloatArray(ECL_RINGS * (ECL_SEG + 1))
+        private var sunPx = 0f
+        private var sunPy = 0f
+        private var sunZ = 0f
+        private var eclCx = 0f
+        private var eclCy = 0f
+
+        private var distTime = 0L
+
+        private val r0Long = R0_KM.toLong()
+        private var distLine2 = ""
+        private var distLine3 = ""
+        // ---------- Milchstraßenebene ----------
+        private val galFill = Path()
+        private val galBack = Path()
+        private val galFront = Path()
+        private val galFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+        private val galPole = DoubleArray(3)
+        private val galN = DoubleArray(3)
+        private val galY = DoubleArray(3)
+        private var galInit = false
+        private val gx = FloatArray(2 * (ECL_SEG + 1))
+        private val gy = FloatArray(2 * (ECL_SEG + 1))
+        private val gz = FloatArray(2 * (ECL_SEG + 1))
         private val hintPath = Path()
         private val hintLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -553,11 +608,186 @@ class GalaxyArrowWallpaperService : WallpaperService() {
             val now = System.currentTimeMillis()
             refreshLocation(now)
             computeDirection(now)
+            computeEcliptic(now)
+            computeGalactic(now)
+            buildEcliptic(w, h)
+            buildGalactic(w, h)
 
             canvas.drawPaint(bgPaint)
             drawStars(canvas, w, h, now)
+            drawGalactic(canvas, false, w)
+            drawEcliptic(canvas, false)
             drawArrow(canvas, w, h)
+            drawGalactic(canvas, true, w)
+            drawEcliptic(canvas, true)
             drawHint(canvas, w, h, now)
+            drawDistance(canvas, w, h, now)
+        }
+
+        private fun computeGalactic(now: Long) {
+            val d = now / 86400000.0 + 2440587.5 - 2451545.0
+            var gmst = (280.46061837 + 360.98564736629 * d) % 360.0
+            if (gmst < 0) gmst += 360.0
+            val lst = Math.toRadians(gmst + lonDeg)
+            val lat = Math.toRadians(latDeg)
+            val decl = Math.toRadians(declDeg.toDouble())
+
+            // galaktischer Nordpol (J2000): RA 192,85948°, Dec +27,12825°
+            celestialToScreen(
+                Math.toRadians(192.85948), Math.toRadians(27.12825),
+                lst, lat, decl, galPole
+            )
+
+            if (!galInit) {
+                for (k in 0 until 3) galN[k] = galPole[k]
+                galInit = true
+            } else {
+                for (k in 0 until 3) galN[k] += (galPole[k] - galN[k]) * 0.2
+            }
+            normalize(galN)
+
+            // senkrecht zur Pfeilachse (galaktisches Zentrum), damit der Pfeil exakt in der Ebene liegt
+            val dot = galN[0] * dirS[0] + galN[1] * dirS[1] + galN[2] * dirS[2]
+            for (k in 0 until 3) galN[k] -= dot * dirS[k]
+            normalize(galN)
+
+            // galaktische Länge 90° = Nordpol x Pfeilachse
+            cross(galN[0], galN[1], galN[2], dirS[0], dirS[1], dirS[2], galY)
+        }
+
+        private fun buildGalactic(w: Float, h: Float) {
+            // gleiche Maße wie beim Pfeil
+            val size = min(w, h) * 0.28f
+            val cx = w / 2f
+            val cy = h * 0.46f
+            galFill.reset()
+            galBack.reset()
+            galFront.reset()
+
+            // Ring 0 = Innenring, Ring 1 = Rand
+            for (k in 0 until 2) {
+                val r = GAL_RADIUS * (k + 1) / 2
+                for (j in 0..ECL_SEG) {
+                    val c = ringCos[j] * r
+                    val s = ringSin[j] * r
+                    // Achse 1 = Pfeilrichtung (Länge 0°), Achse 2 = Länge 90°
+                    val x = (c * dirS[0] + s * galY[0]).toFloat()
+                    val y = (c * dirS[1] + s * galY[1]).toFloat()
+                    val z = (c * dirS[2] + s * galY[2]).toFloat()
+                    val p = CAM / (CAM - z)
+                    val i = k * (ECL_SEG + 1) + j
+                    gx[i] = cx + x * size * p
+                    gy[i] = cy - y * size * p
+                    gz[i] = z
+                }
+            }
+
+            val rim = ECL_SEG + 1
+
+            // Fläche (Handtuch)
+            galFill.moveTo(gx[rim], gy[rim])
+            for (j in 1 until ECL_SEG) galFill.lineTo(gx[rim + j], gy[rim + j])
+            galFill.close()
+
+            // Ringe
+            for (k in 0 until 2) {
+                for (j in 0 until ECL_SEG) {
+                    val i0 = k * (ECL_SEG + 1) + j
+                    val i1 = i0 + 1
+                    val target = if (gz[i0] + gz[i1] < 0f) galBack else galFront
+                    target.moveTo(gx[i0], gy[i0])
+                    target.lineTo(gx[i1], gy[i1])
+                }
+            }
+
+            // vier Speichen: Länge 0°, 90°, 180°, 270°
+            for (a in 0 until 4) {
+                val i = rim + a * (ECL_SEG / 4)
+                val target = if (gz[i] < 0f) galBack else galFront
+                target.moveTo(cx, cy)
+                target.lineTo(gx[i], gy[i])
+            }
+        }
+
+        private fun drawGalacticText(canvas: Canvas, text: String, x: Float, y: Float, w: Float) {
+            val half = textPaint.measureText(text) / 2f
+            val margin = 4f * density
+            val tx = x.coerceIn(half + margin, w - half - margin)
+            canvas.drawText(text, tx, y, textPaint)
+        }
+
+        private fun drawGalactic(canvas: Canvas, front: Boolean, w: Float) {
+            if (!front) {
+                galFillPaint.color = Color.argb(34, 200, 140, 255)
+                canvas.drawPath(galFill, galFillPaint)
+            }
+            gridPaint.color = Color.argb(if (front) 150 else 70, 210, 150, 255)
+            canvas.drawPath(if (front) galFront else galBack, gridPaint)
+
+            if (front) {
+                textPaint.textSize = 11f * density
+                val rim = ECL_SEG + 1
+                val iRot = rim + ECL_SEG / 4
+                val iAnti = rim + ECL_SEG / 2
+                drawGalacticText(canvas, "Rotationsrichtung", gx[iRot], gy[iRot] - 8f * density, w)
+                drawGalacticText(canvas, "Antizentrum", gx[iAnti], gy[iAnti] - 8f * density, w)
+            }
+        }
+
+        // veränderlicher Anteil der Entfernung in km (ohne den großen Basiswert, damit die Rechengenauigkeit reicht)
+        private fun distanceVarKm(now: Long): Double {
+            val d = now / 86400000.0 + 2440587.5 - 2451545.0
+
+            // Sonne (geozentrisch, ekliptikal), einfache Näherung
+            val g = Math.toRadians(357.528 + 0.9856003 * d)
+            val lam = Math.toRadians(280.460 + 0.9856474 * d + 1.915 * sin(g) + 0.020 * sin(2.0 * g))
+            val rAu = 1.00014 - 0.01671 * cos(g) - 0.00014 * cos(2.0 * g)
+            val eps = Math.toRadians(23.4365)
+
+            // Sonnenvektor im Äquatorsystem (in AE)
+            val sx = rAu * cos(lam)
+            val sy = rAu * sin(lam) * cos(eps)
+            val sz = rAu * sin(lam) * sin(eps)
+
+            // Einheitsvektor zum galaktischen Zentrum
+            val ra = Math.toRadians(266.40499)
+            val dec = Math.toRadians(-28.93617)
+            val ux = cos(dec) * cos(ra)
+            val uy = cos(dec) * sin(ra)
+            val uz = sin(dec)
+
+            // steht die Sonne in Richtung Zentrum, ist die Erde dahinter und damit weiter weg
+            val earthTerm = (sx * ux + sy * uy + sz * uz) * AU_KM
+
+            // Eigenbewegung der Sonne zum Zentrum hin, seit J2000
+            val driftKm = SUN_APPROACH_KMS * d * 86400.0
+
+            return earthTerm - driftKm
+        }
+
+        private fun drawDistance(canvas: Canvas, w: Float, h: Float, now: Long) {
+            // nur alle 2 Sekunden neu berechnen
+            if (distTime == 0L || now - distTime >= 1500L) {
+                distTime = now
+                // Basiswert als ganze Zahl, nur der kleine veränderliche Anteil wird in Double gerechnet
+                val km = r0Long + Math.round(distanceVarKm(now))
+                // Änderung pro Sekunde in km/s (aus dem veränderlichen Anteil, daher genau)
+                val v = distanceVarKm(now + 1000L) - distanceVarKm(now)
+                distLine2 = String.format(Locale.GERMAN, "%,d km", km)
+                distLine3 = if (v < 0) {
+                    String.format(Locale.GERMAN, "nähert sich mit %.1f km/s", -v)
+                } else {
+                    String.format(Locale.GERMAN, "entfernt sich mit %.1f km/s", v)
+                }
+            }
+
+            textPaint.textSize = 12f * density
+            val y0 = h * 0.78f
+            val lh = 16f * density
+
+            canvas.drawText("Entfernung zum Zentrum (Sgr A*)", w / 2f, y0, textPaint)
+            canvas.drawText(distLine2, w / 2f, y0 + lh, textPaint)
+            canvas.drawText(distLine3, w / 2f, y0 + 2f * lh, textPaint)
         }
 
         private fun drawStars(canvas: Canvas, w: Float, h: Float, now: Long) {
@@ -575,7 +805,138 @@ class GalaxyArrowWallpaperService : WallpaperService() {
                 }
             }
         }
+        private fun celestialToScreen(
+            ra: Double, dec: Double, lst: Double, lat: Double, decl: Double, out: DoubleArray
+        ) {
+            val ha = lst - ra
+            val east = -cos(dec) * sin(ha)
+            val north = sin(dec) * cos(lat) - cos(dec) * sin(lat) * cos(ha)
+            val up = sin(dec) * sin(lat) + cos(dec) * cos(lat) * cos(ha)
+            // wahrer Norden -> magnetischer Norden
+            val eM = east * cos(decl) - north * sin(decl)
+            val nM = north * cos(decl) + east * sin(decl)
+            val r = rotMat
+            toScreen(
+                r[0] * eM + r[3] * nM + r[6] * up,
+                r[1] * eM + r[4] * nM + r[7] * up,
+                r[2] * eM + r[5] * nM + r[8] * up,
+                out
+            )
+        }
 
+        private fun computeEcliptic(now: Long) {
+            val d = now / 86400000.0 + 2440587.5 - 2451545.0
+            var gmst = (280.46061837 + 360.98564736629 * d) % 360.0
+            if (gmst < 0) gmst += 360.0
+            val lst = Math.toRadians(gmst + lonDeg)
+            val lat = Math.toRadians(latDeg)
+            val decl = Math.toRadians(declDeg.toDouble())
+
+            // Nordpol der Ekliptik: RA 270°, Dec 90° minus Schiefe der Ekliptik (23,4365°)
+            celestialToScreen(Math.toRadians(270.0), Math.toRadians(90.0 - 23.4365), lst, lat, decl, eclPole)
+            // Frühlingspunkt (Ekliptiklänge 0°): RA 0°, Dec 0°
+            celestialToScreen(0.0, 0.0, lst, lat, decl, eclEquinox)
+
+            if (!eclInit) {
+                for (k in 0 until 3) {
+                    eclN[k] = eclPole[k]
+                    eclX[k] = eclEquinox[k]
+                }
+                eclInit = true
+            } else {
+                for (k in 0 until 3) {
+                    eclN[k] += (eclPole[k] - eclN[k]) * 0.2
+                    eclX[k] += (eclEquinox[k] - eclX[k]) * 0.2
+                }
+            }
+            normalize(eclN)
+            val dot = eclX[0] * eclN[0] + eclX[1] * eclN[1] + eclX[2] * eclN[2]
+            for (k in 0 until 3) eclX[k] -= dot * eclN[k]
+            normalize(eclX)
+            // Ekliptiklänge 90° = Nordpol x Frühlingspunkt
+            cross(eclN[0], eclN[1], eclN[2], eclX[0], eclX[1], eclX[2], eclY)
+
+            // Sonne (einfache Näherung, für die Anzeige völlig ausreichend)
+            val g = Math.toRadians(357.528 + 0.9856003 * d)
+            val meanLon = 280.460 + 0.9856474 * d
+            sunLonRad = Math.toRadians(meanLon + 1.915 * sin(g) + 0.020 * sin(2.0 * g))
+        }
+
+        private fun buildEcliptic(w: Float, h: Float) {
+            // gleiche Maße wie beim Pfeil
+            val size = min(w, h) * 0.28f
+            val cx = w / 2f
+            val cy = h * 0.46f
+            eclCx = cx
+            eclCy = cy
+            gridBack.reset()
+            gridFront.reset()
+
+            for (k in 0 until ECL_RINGS) {
+                val r = ECL_RADIUS * (k + 1) / ECL_RINGS
+                for (j in 0..ECL_SEG) {
+                    val c = ringCos[j] * r
+                    val s = ringSin[j] * r
+                    val x = (c * eclX[0] + s * eclY[0]).toFloat()
+                    val y = (c * eclX[1] + s * eclY[1]).toFloat()
+                    val z = (c * eclX[2] + s * eclY[2]).toFloat()
+                    val p = CAM / (CAM - z)
+                    val i = k * (ECL_SEG + 1) + j
+                    ex[i] = cx + x * size * p
+                    ey[i] = cy - y * size * p
+                    ez[i] = z
+                }
+            }
+
+            // Ringe
+            for (k in 0 until ECL_RINGS) {
+                for (j in 0 until ECL_SEG) {
+                    val i0 = k * (ECL_SEG + 1) + j
+                    val i1 = i0 + 1
+                    val target = if (ez[i0] + ez[i1] < 0f) gridBack else gridFront
+                    target.moveTo(ex[i0], ey[i0])
+                    target.lineTo(ex[i1], ey[i1])
+                }
+            }
+
+            // Strahlen vom Mittelpunkt zum äußeren Ring
+            val outer = (ECL_RINGS - 1) * (ECL_SEG + 1)
+            val step = ECL_SEG / ECL_RAYS
+            for (a in 0 until ECL_RAYS) {
+                val i = outer + a * step
+                val target = if (ez[i] < 0f) gridBack else gridFront
+                target.moveTo(cx, cy)
+                target.lineTo(ex[i], ey[i])
+            }
+
+            // Sonne auf dem äußeren Ring
+            val cs = cos(sunLonRad)
+            val sn = sin(sunLonRad)
+            val sx = (ECL_RADIUS * (cs * eclX[0] + sn * eclY[0])).toFloat()
+            val sy = (ECL_RADIUS * (cs * eclX[1] + sn * eclY[1])).toFloat()
+            val sz = (ECL_RADIUS * (cs * eclX[2] + sn * eclY[2])).toFloat()
+            val p = CAM / (CAM - sz)
+            sunPx = cx + sx * size * p
+            sunPy = cy - sy * size * p
+            sunZ = sz
+        }
+
+        private fun drawEcliptic(canvas: Canvas, front: Boolean) {
+            gridPaint.color = Color.argb(if (front) 120 else 55, 110, 190, 255)
+            canvas.drawPath(if (front) gridFront else gridBack, gridPaint)
+
+            if ((sunZ >= 0f) == front) {
+                val a = if (front) 255 else 150
+                gridPaint.color = Color.argb(a / 2, 255, 214, 120)
+                canvas.drawLine(eclCx, eclCy, sunPx, sunPy, gridPaint)
+                sunPaint.color = Color.argb(a / 4, 255, 214, 120)
+                canvas.drawCircle(sunPx, sunPy, 13f * density, sunPaint)
+                sunPaint.color = Color.argb(a, 255, 226, 150)
+                canvas.drawCircle(sunPx, sunPy, 6f * density, sunPaint)
+                textPaint.textSize = 11f * density
+                canvas.drawText("Sonne", sunPx, sunPy - 18f * density, textPaint)
+            }
+        }
         private fun cross(
             ax: Double, ay: Double, az: Double,
             bx: Double, by: Double, bz: Double,
@@ -727,7 +1088,7 @@ class GalaxyArrowWallpaperService : WallpaperService() {
 
         private fun drawLabel(canvas: Canvas, w: Float, h: Float) {
             textPaint.textSize = 11f * density
-            val y0 = h * 0.76f
+            val y0 = h * 0.66f
             val lh = 15f * density
 
             val line1 = String.format(
